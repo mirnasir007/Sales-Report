@@ -22,7 +22,7 @@
     .missing-list li { background: #ffcdd2; padding: 3px 6px; border-radius: 4px; }
     
     label { font-weight: bold; margin-bottom: 4px; color: #333; font-size: 13px; }
-    input[type="date"] { padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; }
+    input[type="date"], input[type="text"] { padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; box-sizing: border-box; outline: none; }
     
     .btn { background: #00bcd4; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: bold; transition: 0.3s; height: 34px;}
     .btn:hover { background: #008ba3; }
@@ -58,6 +58,10 @@
         <div class="control-row">
           <button class="btn" onclick="loadReport()">Generate Report</button>
           <button id="excelBtn" class="btn btn-excel" onclick="downloadCourierExcel()">Download Excel</button>
+          <div id="searchContainer" style="display: flex; align-items: center; gap: 5px;">
+            <input type="text" id="searchInput" placeholder="Phone or Order ID" onkeypress="if(event.key === 'Enter') searchData()">
+            <button class="btn" onclick="searchData()">Search</button>
+          </div>
           <span id="statusMsg">Processing Data... ⏳</span>
         </div>
       </div>
@@ -94,9 +98,11 @@
 
   <script>
     let globalMergedData = [];
+    let lastLoadedFromDate = "";
+    let lastLoadedToDate = "";
     
-    // script url
-    const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbygGelyFbw30ZERIQBcMGZV9Pligj7n8gzd3PYJfKBE8gyBRNyd_qGNLJzs2o9eNFbi/exec";
+    // node js server url
+    const SCRIPT_URL = "https://sales-report-backend-23lt.onrender.com/api/reports";
 
     window.onload = function() {
       let today = new Date().toISOString().split('T')[0];
@@ -120,122 +126,138 @@
     }
 
     function loadReport() {
-      let fDate = document.getElementById('fromDate').value;
-      let eDate = document.getElementById('endDate').value;
-      if(!fDate || !eDate) return alert("Please select both dates!");
+      return new Promise((resolve, reject) => {
+        let fDate = document.getElementById('fromDate').value;
+        let eDate = document.getElementById('endDate').value;
+        if(!fDate || !eDate) {
+          alert("Please select both dates!");
+          return reject("Dates missing");
+        }
 
-      let apiFromDate = formatDateForAPI(fDate);
-      let apiEndDate = formatDateForAPI(eDate);
+        // If data is already loaded for these dates, don't fetch again
+        if(fDate === lastLoadedFromDate && eDate === lastLoadedToDate && globalMergedData.length > 0) {
+          renderTable(globalMergedData);
+          return resolve(globalMergedData);
+        }
 
-      document.getElementById('statusMsg').style.display = 'inline-block';
-      document.getElementById('statusMsg').innerText = "Processing Data... ⏳";
-      document.getElementById('excelBtn').style.display = 'none';
-      document.getElementById('missingBox').style.display = 'none';
-      document.getElementById('tableBody').innerHTML = "";
+        let apiFromDate = formatDateForAPI(fDate);
+        let apiEndDate = formatDateForAPI(eDate);
 
-      // google.script.run changes Fetch API use
-      fetch(SCRIPT_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'text/plain;charset=utf-8'
-        },
-        body: JSON.stringify({
-          fromDate: apiFromDate,
-          endDate: apiEndDate
+        document.getElementById('statusMsg').style.display = 'inline-block';
+        document.getElementById('statusMsg').innerText = "Processing Data... ⏳";
+        document.getElementById('excelBtn').style.display = 'none';
+        document.getElementById('missingBox').style.display = 'none';
+        document.getElementById('tableBody').innerHTML = "";
+
+        // google.script.run changes Fetch API use
+        fetch(SCRIPT_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            fromDate: apiFromDate,
+            endDate: apiEndDate
+          })
         })
-      })
-      .then(response => response.json())
-      .then(res => {
-        if(!res.success) {
-          document.getElementById('statusMsg').innerText = "Error: " + res.error;
-          return;
-        }
-
-        try {
-          let summaryJson = parseExcelBase64(res.summaryData);
-          let detailsJson = parseExcelBase64(res.detailsData);
-          let missingCheckJson = parseExcelBase64(res.missingData);
-
-          let detailsMap = {};
-          for(let i = 2; i < detailsJson.length; i++) {
-            let row = detailsJson[i];
-            if(!row || !row[1]) continue; 
-            
-            let storeName = row[0] ? row[0].toString() : "";
-            let invNo = row[1].toString().trim();
-            let prodName = row[5] ? row[5].toString().trim() : "";
-            let qty = parseFloat(row[8]) || 0; 
-
-            if(storeName.includes('SUB TOTAL:') || prodName.includes('Delivery Charges') || prodName === "") continue; 
-
-            if(!detailsMap[invNo]) detailsMap[invNo] = { qty: 0, products: [] };
-            detailsMap[invNo].qty += qty;
-            detailsMap[invNo].products.push(prodName);
+        .then(response => response.json())
+        .then(res => {
+          if(!res.success) {
+            document.getElementById('statusMsg').innerText = "Error: " + res.error;
+            return reject(res.error);
           }
 
-          let finalData = [];
-          let summaryInvoices = new Set();
-          
-          for(let i = 2; i < summaryJson.length; i++) {
-            let row = summaryJson[i];
-            if(!row || row.length < 6 || !row[5] || row[0]?.toString().includes('PFF') || row[0]?.toString().includes('Total')) continue;
+          try {
+            let summaryJson = parseExcelBase64(res.summaryData);
+            let detailsJson = parseExcelBase64(res.detailsData);
+            let missingCheckJson = parseExcelBase64(res.missingData);
 
-            let invNo = row[5].toString().trim();
-            summaryInvoices.add(invNo);
-            let matchedDetails = detailsMap[invNo]; 
+            let detailsMap = {};
+            for(let i = 2; i < detailsJson.length; i++) {
+              let row = detailsJson[i];
+              if(!row || !row[1]) continue; 
+              
+              let storeName = row[0] ? row[0].toString() : "";
+              let invNo = row[1].toString().trim();
+              let prodName = row[5] ? row[5].toString().trim() : "";
+              let qty = parseFloat(row[8]) || 0; 
 
-            finalData.push({
-              INVOICE_NO: invNo,
-              CUSTOMER_NAME: row[2] || "",
-              CUSTOMER_PHONE: row[3] ? row[3].toString().replace(/\D/g, '').replace(/^88/, '') : "",
-              CUSTOMER_ADDRESS: row[4] || "",
-              DISC_AMT: row[7] || 0,
-              NET_AMT: row[8] || 0,
-              CASH_AMT: row[9] || 0,
-              CARD_AMT: row[10] || 0,
-              PAYMENT_TYPE: row[11] || "",
-              QTY: matchedDetails ? matchedDetails.qty : 1, 
-              PRODUCTS: matchedDetails ? matchedDetails.products.join(', ') : "Assorted Products"
-            });
-          }
+              if(storeName.includes('SUB TOTAL:') || prodName.includes('Delivery Charges') || prodName === "") continue; 
 
-          finalData.sort((a, b) => a.INVOICE_NO.localeCompare(b.INVOICE_NO));
-
-          globalMergedData = finalData;
-
-          let missingInvoices = [];
-          let allPosInvoices = Object.keys(detailsMap);
-
-          for(let i = 0; i < allPosInvoices.length; i++) {
-            let invNo = allPosInvoices[i];
-            
-            if(!summaryInvoices.has(invNo) && invNo !== "" && !invNo.includes('INVOICE')) {
-              missingInvoices.push(invNo);
+              if(!detailsMap[invNo]) detailsMap[invNo] = { qty: 0, products: [] };
+              detailsMap[invNo].qty += qty;
+              detailsMap[invNo].products.push(prodName);
             }
+
+            let finalData = [];
+            let summaryInvoices = new Set();
+            
+            for(let i = 2; i < summaryJson.length; i++) {
+              let row = summaryJson[i];
+              if(!row || row.length < 6 || !row[5] || row[0]?.toString().includes('PFF') || row[0]?.toString().includes('Total')) continue;
+
+              let invNo = row[5].toString().trim();
+              summaryInvoices.add(invNo);
+              let matchedDetails = detailsMap[invNo]; 
+
+              finalData.push({
+                INVOICE_NO: invNo,
+                CUSTOMER_NAME: row[2] || "",
+                CUSTOMER_PHONE: row[3] ? row[3].toString().replace(/\D/g, '').replace(/^88/, '') : "",
+                CUSTOMER_ADDRESS: row[4] || "",
+                DISC_AMT: row[7] || 0,
+                NET_AMT: row[8] || 0,
+                CASH_AMT: row[9] || 0,
+                CARD_AMT: row[10] || 0,
+                PAYMENT_TYPE: row[11] || "",
+                QTY: matchedDetails ? matchedDetails.qty : 1, 
+                PRODUCTS: matchedDetails ? matchedDetails.products.join(', ') : "Assorted Products"
+              });
+            }
+
+            finalData.sort((a, b) => a.INVOICE_NO.localeCompare(b.INVOICE_NO));
+
+            globalMergedData = finalData;
+            lastLoadedFromDate = fDate;
+            lastLoadedToDate = eDate;
+
+            let missingInvoices = [];
+            let allPosInvoices = Object.keys(detailsMap);
+
+            for(let i = 0; i < allPosInvoices.length; i++) {
+              let invNo = allPosInvoices[i];
+              
+              if(!summaryInvoices.has(invNo) && invNo !== "" && !invNo.includes('INVOICE')) {
+                missingInvoices.push(invNo);
+              }
+            }
+
+            if(missingInvoices.length > 0) {
+              document.getElementById('missingBox').style.display = 'block';
+              document.getElementById('missingList').innerHTML = missingInvoices.map(inv => `<li>${inv}</li>`).join('');
+            }
+
+            if(finalData.length === 0) {
+              document.getElementById('statusMsg').innerText = "No data found!";
+              return resolve([]);
+            }
+
+            document.getElementById('statusMsg').style.display = 'none';
+            renderTable(finalData);
+            document.getElementById('excelBtn').style.display = 'inline-block';
+            resolve(finalData);
+
+          } catch(err) {
+            document.getElementById('statusMsg').innerText = "Process Failed!";
+            console.error(err);
+            reject(err);
           }
-
-          if(missingInvoices.length > 0) {
-            document.getElementById('missingBox').style.display = 'block';
-            document.getElementById('missingList').innerHTML = missingInvoices.map(inv => `<li>${inv}</li>`).join('');
-          }
-
-          if(finalData.length === 0) {
-            document.getElementById('statusMsg').innerText = "No data found!";
-            return;
-          }
-
-          document.getElementById('statusMsg').style.display = 'none';
-          renderTable(finalData);
-          document.getElementById('excelBtn').style.display = 'inline-block';
-
-        } catch(err) {
-          document.getElementById('statusMsg').innerText = "Process Failed!";
-          console.error(err);
-        }
-      })
-      .catch(error => {
-        document.getElementById('statusMsg').innerText = "Network Error! Check console.";
-        console.error("Fetch Error: ", error);
+        })
+        .catch(error => {
+          document.getElementById('statusMsg').innerText = "Network Error! Check console.";
+          console.error("Fetch Error: ", error);
+          reject(error);
+        });
       });
     }
 
@@ -281,6 +303,44 @@
       let wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Sales_Data");
       XLSX.writeFile(wb, `Sales_Report_${document.getElementById('fromDate').value}.xlsx`);
+    }
+
+    function searchData() {
+      let query = document.getElementById('searchInput').value.trim().toLowerCase();
+      let fDate = document.getElementById('fromDate').value;
+      let eDate = document.getElementById('endDate').value;
+      
+      // If data is empty or dates have changed, load data first, then search
+      if (globalMergedData.length === 0 || fDate !== lastLoadedFromDate || eDate !== lastLoadedToDate) {
+        loadReport().then(() => {
+          applyFilter(query);
+        }).catch(err => console.error("Could not load data for search", err));
+      } else {
+        // Data is already loaded for the current dates
+        applyFilter(query);
+      }
+    }
+
+    function applyFilter(query) {
+      if (!query) {
+        renderTable(globalMergedData);
+        return;
+      }
+      
+      let filteredData = globalMergedData.filter(item => {
+        let inv = item.INVOICE_NO ? item.INVOICE_NO.toString().toLowerCase() : "";
+        let phone = item.CUSTOMER_PHONE ? item.CUSTOMER_PHONE.toString().toLowerCase() : "";
+        return inv.includes(query) || phone.includes(query);
+      });
+      
+      renderTable(filteredData);
+      
+      if(filteredData.length === 0) {
+        document.getElementById('statusMsg').style.display = 'inline-block';
+        document.getElementById('statusMsg').innerText = "No match found for this search.";
+      } else {
+        document.getElementById('statusMsg').style.display = 'none';
+      }
     }
   </script>
 </body>
